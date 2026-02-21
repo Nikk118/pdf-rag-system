@@ -48,7 +48,7 @@ local-pdf-rag/
 ### 1. Clone the repository
 
 ```
-git clone https://github.com/YOUR_USERNAME/local-pdf-rag.git
+git clone https://github.com/Nikk118/local-pdf-rag.git
 cd local-pdf-rag
 ```
 

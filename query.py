@@ -1,12 +1,8 @@
-# ================================
-# query.py — Production RAG Query (Improved Complete Answers)
-# ================================
+# ==========================================
+# RAG + Conversational Memory (Single File)
+# ==========================================
 
 import os
-
-# Force Hugging Face to use D: drive cache
-os.environ["HF_HOME"] = "D:/huggingface_cache"
-
 import faiss
 import pickle
 import numpy as np
@@ -14,9 +10,76 @@ from sentence_transformers import SentenceTransformer
 from transformers import pipeline
 from config import *
 
+# ==========================
+# CONFIGURATION
+# ==========================
+
+
+
+MAX_CONTEXT_LENGTH = 1500
+MAX_HISTORY_TURNS = 5
+MEMORY_PATH = "vector_store/conversation_memory.pkl"
+CHUNKS_FILE_PATH = globals().get("CHUNKS_PATH", "vector_store/chunks.pkl")
+
+# Force HuggingFace cache to D drive
+os.environ["HF_HOME"] = "D:/huggingface_cache"
+
+
+
+def load_memory(path):
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "rb") as f:
+            memory = pickle.load(f)
+        if isinstance(memory, list):
+            return memory
+    except Exception:
+        pass
+    return []
+
+
+def save_memory(path, memory):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(memory, f)
+
+
+def build_context(chunks_data, retrieved_indices, max_context_length):
+    selected = []
+    total_len = 0
+    for idx in retrieved_indices:
+        if idx < 0 or idx >= len(chunks_data):
+            continue
+        chunk = chunks_data[idx].strip()
+        if not chunk:
+            continue
+        next_len = total_len + len(chunk) + (1 if selected else 0)
+        if next_len > max_context_length:
+            break
+        selected.append(chunk)
+        total_len = next_len
+    return "\n".join(selected)
+
+
+def build_history(memory, max_turns):
+    lines = []
+    for turn in memory[-max_turns:]:
+        lines.append(f"User: {turn['question']}")
+        lines.append(f"Assistant: {turn['answer']}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def extract_answer(generated_text):
+    marker = "Answer:"
+    if marker in generated_text:
+        return generated_text.rsplit(marker, 1)[-1].strip()
+    return generated_text.strip()
+
+
 print("Loading embedding model...")
 embed_model = SentenceTransformer(EMBED_MODEL)
-
 
 print("Loading LLM...")
 generator = pipeline(
@@ -26,18 +89,18 @@ generator = pipeline(
     torch_dtype="auto"
 )
 
-
 print("Loading vector database...")
 index = faiss.read_index(VECTOR_DB_PATH)
 
-with open("vector_store/chunks.pkl", "rb") as f:
+with open(CHUNKS_FILE_PATH, "rb") as f:
     chunks = pickle.load(f)
+
+conversation_history = load_memory(MEMORY_PATH)
+if len(conversation_history) > MAX_HISTORY_TURNS:
+    conversation_history = conversation_history[-MAX_HISTORY_TURNS:]
 
 print("\nRAG system ready.")
 
-
-# Limit context size to prevent overload
-MAX_CONTEXT_LENGTH = 1500
 
 
 while True:
@@ -47,64 +110,68 @@ while True:
     if query.lower() == "exit":
         break
 
-    # Create embedding
-    query_embedding = embed_model.encode([query])
-    query_embedding = np.array(query_embedding).astype("float32")
-
-    # Search vector DB
-    distances, indices = index.search(query_embedding, TOP_K)
-
-    # Build controlled context
-    context = ""
-
-    for idx in indices[0]:
-        chunk = chunks[idx]
-
-        if len(context) + len(chunk) > MAX_CONTEXT_LENGTH:
-            break
-
-        context += chunk + "\n"
 
 
-    # Improved prompt forcing complete answer
+    query_embedding = np.asarray(
+        embed_model.encode([query]),
+        dtype=np.float32
+    )
+
+    _, indices = index.search(query_embedding, TOP_K)
+    context = build_context(chunks, indices[0], MAX_CONTEXT_LENGTH)
+    history_text = build_history(conversation_history, MAX_HISTORY_TURNS)
+
+
+
     prompt = f"""
 You are a helpful AI assistant.
 
-Answer the question using ONLY the context below.
+Use conversation history and context to answer.
 
-INSTRUCTIONS:
-- Give a clear and complete explanation.
-- Use simple language.
-- Structure your answer properly.
-- Finish your answer cleanly.
-- Do NOT include unrelated sentences.
-- Do NOT jump between topics.
-- If the answer is not in the context, say "I don't know".
+RULES:
+- Answer using ONLY the context.
+- If answer not in context, say "I don't know".
+- Keep answer clear and structured.
+- Finish cleanly.
+
+Conversation History:
+{history_text}
 
 Context:
 {context}
 
-Question: {query}
+User Question: {query}
 
-Answer in clear paragraph form:
+Answer:
 """
 
-    # Generate response with proper length
+
+
     result = generator(
         prompt,
-        max_new_tokens=500,   # increased for complete answers
+        max_new_tokens=500,
         do_sample=False,
         eos_token_id=generator.tokenizer.eos_token_id
     )
 
-
     full_output = result[0]["generated_text"]
+    answer = extract_answer(full_output)
 
-    answer = full_output.split("Answer:")[-1].strip()
+   
+
+    conversation_history.append({
+        "question": query,
+        "answer": answer
+    })
+
+ 
+    if len(conversation_history) > MAX_HISTORY_TURNS:
+        conversation_history = conversation_history[-MAX_HISTORY_TURNS:]
+
+    save_memory(MEMORY_PATH, conversation_history)
 
 
     print("\n====================")
     print("Answer:")
     print("====================\n")
-
     print(answer)
